@@ -1,0 +1,114 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import logging
+from typing import Any, Optional
+import requests
+from omegaconf import DictConfig
+from rlinf.data.io_struct import RolloutResult
+from .base_api_worker import BaseAPIWorker
+
+
+class HttpAPIWorker(BaseAPIWorker):
+    """基于 HTTP 的 API 工作器，处理 Rollout 输出与外部 API 交互"""
+
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        self.api_url = cfg.apiworkers.api_url
+        self.api_key = cfg.apiworkers.get("api_key")
+        self.timeout = cfg.apiworkers.get("timeout", 30)
+        self.headers = self._init_headers()
+
+    def _init_headers(self) -> dict:
+        """初始化 HTTP 请求头"""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def init_worker(self):
+        """初始化工作器：验证 API 连接性"""
+        try:
+            # 测试 API 连通性
+            response = requests.get(
+                f"{self.api_url}/health",
+                headers=self.headers,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            logging.info(f"Successfully connected to API at {self.api_url}")
+        except Exception as e:
+            logging.error(f"API connection test failed: {str(e)}")
+            raise  # 初始化失败时终止
+
+    def _format_rollout_data(self, rollout_result: RolloutResult) -> dict:
+        """将 RolloutResult 格式化为 API 所需输入"""
+        # 根据 RolloutResult 结构和外部 API 需求调整格式
+        return {
+            "num_sequence": rollout_result.num_sequence,
+            "group_size": rollout_result.group_size,
+            "prompts": rollout_result.prompt_texts,
+            "responses": rollout_result.response_texts,
+            "rewards": rollout_result.rewards.tolist() if rollout_result.rewards is not None else None,
+            "timestamps": [self._get_timestamp()] * rollout_result.num_sequence
+        }
+
+    def _get_timestamp(self) -> str:
+        """获取当前时间戳（UTC）"""
+        from datetime import datetime
+        return datetime.utcnow().isoformat()
+
+    def process_rollout(self, rollout_result: RolloutResult) -> Any:
+        """处理 Rollout 数据并调用外部 API"""
+        try:
+            # 格式化输入数据
+            api_input = self._format_rollout_data(rollout_result)
+            
+            # 调用外部 API
+            response = requests.post(
+                self.api_url,
+                headers=self.headers,
+                data=json.dumps({"inputs": api_input}),
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.Timeout:
+            logging.error("API request timed out")
+            return {"error": "timeout", "data": None}
+        except Exception as e:
+            logging.error(f"API request failed: {str(e)}")
+            return {"error": str(e), "data": None}
+
+    def run(self):
+        """主循环：持续处理 Rollout 输出"""
+        assert self._input_channel is not None, "Input channel not set"
+        assert self._output_channel is not None, "Output channel not set"
+
+        logging.info("Starting HttpAPIWorker main loop")
+        while True:
+            # 从输入通道获取 Rollout 结果
+            rollout_result: RolloutResult = self._input_channel.get()
+            
+            # 处理并调用 API
+            api_result = self.process_rollout(rollout_result)
+            
+            # 将结果发送到输出通道
+            self._output_channel.put({
+                "rollout_id": id(rollout_result),  # 用于关联请求和响应
+                "api_result": api_result,
+                "timestamp": self._get_timestamp()
+            })

@@ -40,7 +40,7 @@ if [[ " ${EMBODIED_TARGET[*]} " == *" $TARGET "* ]]; then
     uv sync --extra embodied
     uv pip uninstall pynvml
     bash requirements/install_embodied_deps.sh # Must be run after the above command
-    mkdir -p /opt && git clone https://github.com/RLinf/LIBERO.git /opt/libero
+    # mkdir -p /opt && git clone https://github.com/RLinf/LIBERO.git /opt/libero
     echo "export PYTHONPATH=/opt/libero:$PYTHONPATH" >> .venv/bin/activate
 fi
 

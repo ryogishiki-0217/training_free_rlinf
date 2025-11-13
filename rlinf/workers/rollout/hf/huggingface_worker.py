@@ -198,6 +198,9 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model = self.hf_model.to(self.device)
 
     def sync_model_from_actor(self):
+        # print("即将进入断点所在行")
+        # print("-----------------------------------------------------------")
+        # import pdb; pdb.set_trace() 
         param_state_dict = self.recv(self._actor_group_name, src_rank=self._rank)
 
         self.hf_model.load_state_dict(param_state_dict)

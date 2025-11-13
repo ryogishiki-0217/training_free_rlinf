@@ -1,2 +1,2 @@
-
-openpi @ git+https://github.com/RLinf/openpi
+openpi @ file:///home/cn/openpi
+# openpi @ git+https://github.com/RLinf/openpi
