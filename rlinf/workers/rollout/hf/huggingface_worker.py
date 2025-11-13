@@ -18,6 +18,10 @@ import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
+from datetime import datetime  # 新增：导入datetime模块
+from pathlib import Path  # 新增：用于路径处理
+import json  # 新增：导入json模块
+
 from rlinf.data.io_struct import EmbodiedRolloutResult
 from rlinf.models import get_model, get_vla_model_config_and_processor
 from rlinf.scheduler import Cluster, Worker
@@ -41,6 +45,23 @@ class MultiStepRolloutWorker(Worker):
 
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
         self.channel = self.connect_channel(cfg.rollout.channel.name)
+
+        # 新增：初始化记录相关参数
+        self.record_enabled = cfg.rollout.get("record", False)  # 从配置读取开关
+        self.record_path = self._init_record_path()  # 初始化记录路径
+        self.rollout_records = []  # 存储记录的列表
+
+    def _init_record_path(self):
+        """初始化记录文件保存路径"""
+        if not self.record_enabled:
+            return None
+        # 从配置获取路径，默认当前目录下"rollout_records"文件夹
+        base_path = Path(self.cfg.rollout.get("record_path", "./rollout_records"))
+        # 创建带时间戳的子目录，避免覆盖
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        record_dir = base_path / f"rank_{self._rank}_{timestamp}"
+        record_dir.mkdir(parents=True, exist_ok=True)
+        return record_dir
 
     def init_worker(self):
         # NOTE:
@@ -67,7 +88,11 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.cfg.rollout.get("enable_offload", False):
             self.offload_model()
-
+            
+        # 新增：如果启用记录，打印提示
+        if self.record_enabled:
+            self.log_info(f"Rollout记录已启用，保存路径：{self.record_path}")
+            
     def setup_sample_params(self):
         # length parameters for rollout
         self._length_params = OmegaConf.to_container(
@@ -142,20 +167,35 @@ class MultiStepRolloutWorker(Worker):
                 )
 
     def generate(self):
+        # 新增：每次生成前清空记录列表
+        if self.record_enabled:
+            self.rollout_records.clear()
+            
         if self.cfg.rollout.get("enable_offload", False):
             self.reload_model()
         self.buffer_list = [EmbodiedRolloutResult() for _ in range(self.stage_num)]
 
-        for _ in tqdm(
+        for epoch in tqdm(
             range(self.cfg.algorithm.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            for _ in range(self.cfg.algorithm.n_chunk_steps):
+            for chunk in range(self.cfg.algorithm.n_chunk_steps):
                 for i in range(self.stage_num):
                     env_output = self.recv_env_output()
                     self.update_env_output(i, env_output)
                     actions, result = self.predict(env_output["obs"])
+
+                    # 新增：记录输入输出（根据任务类型调整字段）
+                    if self.record_enabled:
+                        self._record_step(
+                            epoch=epoch,
+                            chunk=chunk,
+                            stage=i,
+                            env_obs=env_output["obs"],  # 问题/观测输入
+                            actions=actions,  # 模型输出
+                            result=result  # 额外结果（如logits等）
+                        )
 
                     self.buffer_list[i].append_result(result)
 
@@ -175,6 +215,48 @@ class MultiStepRolloutWorker(Worker):
 
         if self.cfg.rollout.get("enable_offload", False):
             self.offload_model()
+            
+        # 新增：生成结束后保存记录
+        if self.record_enabled:
+            self._save_records()
+
+    def _record_step(self, epoch, chunk, stage, env_obs, actions, result):
+        """记录单步的输入输出"""
+        # 根据实际任务类型解析obs（这里以具身任务为例，可根据需求修改）
+        record = {
+            "epoch": epoch,
+            "chunk": chunk,
+            "stage": stage,
+            "timestamp": datetime.now().isoformat(),
+            "input": {
+                # 示例：解析观测数据（根据env_obs的实际结构调整）
+                "obs_shape": env_obs["obs"].shape if "obs" in env_obs else None,
+                "dones": env_obs["dones"].tolist() if "dones" in env_obs else None,
+                # 若为文本任务，可直接记录文本："prompt": env_obs["prompt"]
+            },
+            "output": {
+                "actions": actions.tolist(),  # 模型生成的动作/输出
+                "action_shape": actions.shape,
+                # 可选：记录额外信息（如价值估计、logprobs等）
+                "values": result["prev_values"].tolist() if "prev_values" in result else None
+            }
+        }
+        self.rollout_records.append(record)
+
+    def _save_records(self):
+        """将记录保存为JSON文件"""
+        if not self.rollout_records:
+            self.log_warn("没有记录可保存")
+            return
+
+        # 保存为JSON Lines格式（每行一个JSON对象，便于处理大文件）
+        record_file = self.record_path / "rollout_records.jsonl"
+        with open(record_file, "w", encoding="utf-8") as f:
+            for record in self.rollout_records:
+                json.dump(record, f, ensure_ascii=False)
+                f.write("\n")
+
+        self.log_info(f"已保存{len(self.rollout_records)}条记录到：{record_file}")
 
     def evaluate(self):
         if self.cfg.rollout.get("enable_offload", False):

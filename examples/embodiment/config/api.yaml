@@ -103,7 +103,9 @@ rollout:
   precision: ${actor.model.precision}
   enable_offload: True
   pipeline_stage_num: 2
-
+  record: True  # 新增：是否记录输入输出，True/False
+  record_path: "./rollout_records"  # 新增：记录文件保存路径
+  
 actor:
   group_name: "ActorGroup"
   channel:
