@@ -19,6 +19,7 @@ from typing import Any
 from ..worker import Worker, WorkerAddress
 from .channel import DEFAULT_KEY
 
+import logging
 
 @dataclass(order=True)
 class WeightedItem:
@@ -239,6 +240,10 @@ class ChannelWorker(Worker):
         super().__init__()
         self._queue_map: dict[str, PeekQueue] = {}
         self._queue_map[DEFAULT_KEY] = PeekQueue(maxsize=maxsize)
+        self.logger.info(f"--------------------------------------------")
+        self.logger = logging.getLogger("ChannelWorker")
+        self.logger.info(f"ChannelWorker initializing...")
+        self.logger.info(f"--------------------------------------------")
 
     def create_queue(self, key: Any, maxsize: int = 0):
         """Create a new queue in the channel. No effect if a queue with the same name already exists.

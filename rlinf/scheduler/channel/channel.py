@@ -26,6 +26,8 @@ from ..manager import WorkerAddress
 from ..placement import NodePlacementStrategy
 from ..worker import Worker, WorkerGroup
 
+import logging
+
 if TYPE_CHECKING:
     from .channel_worker import LocalChannel
 

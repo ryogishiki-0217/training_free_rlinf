@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import logging  # 新增：引入日志模块
 
 from omegaconf.dictconfig import DictConfig
 from tqdm import tqdm
@@ -25,6 +26,9 @@ from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
+import json
+from pathlib import Path
+from datetime import datetime
 
 class FrozenModelRunner:
     def __init__(
@@ -56,8 +60,24 @@ class FrozenModelRunner:
         self.timer = ScopedTimer(reduction="max", sync_cuda=False)
         self.metric_logger = MetricLogger(cfg)
 
-        # 冻结所有模型参数
-        self.freeze_model_parameters()
+        # 新增：标记是否需要冻结模型，延迟到init_workers后执行
+        self.need_freeze = True
+
+        # 移除：__init__中不再直接调用冻结逻辑
+        # self.freeze_model_parameters()
+        
+        self.record_cfg = cfg.runner.get("record", {})
+        self.record_enabled = self.record_cfg.get("enable", False)
+        self.record_buffer = []  # 缓冲区减少IO操作
+        if self.record_enabled:
+            self._init_record_dir()
+            # 记录需要包含的字段（从配置读取，默认全记录）
+            self.include_fields = self.record_cfg.get("include", {
+                "env_input": True,
+                "rollout_trajectories": True,
+                "actor_advantages": True
+            })
+
 
     def init_workers(self):
         # 初始化worker，按顺序创建以减少内存占用峰值
@@ -68,33 +88,31 @@ class FrozenModelRunner:
         # 恢复检查点（如果需要）
         if self.cfg.runner.get("resume_dir", None) is not None:
             self.global_step = int(self.cfg.runner.resume_dir.split("global_step_")[-1])
+            logging.info(f"从检查点恢复，全局步数设置为: {self.global_step}")
+
+        # 新增：在所有worker初始化完成后执行冻结
+        if self.need_freeze:
+            self.freeze_model_parameters()
+            self.need_freeze = False  # 确保只冻结一次
 
     def freeze_model_parameters(self):
-        """冻结所有模型参数，禁止梯度更新"""
-        # 冻结actor模型参数
-        for param in self.actor.model.parameters():
-            param.requires_grad = False
-        
-        # 如果有critic模型也冻结其参数
-        if self.critic is not None:
-            for param in self.critic.model.parameters():
-                param.requires_grad = False
+        """冻结所有模型参数，禁止梯度更新（通过Worker接口分发指令）"""
+        try:
+            # 关键修复：通过WorkerGroup的apply_all分发冻结指令到子Worker
+            logging.info("开始冻结Actor模型参数...")
+            actor_futures = self.actor.freeze_parameters()
+            actor_futures.wait()  # 等待所有Actor Worker完成冻结
+            logging.info("Actor模型参数冻结完成")
 
-    def generate_rollouts(self):
-        """生成rollout数据，不涉及权重更新"""
-        env_futures = self.env.interact()
-        rollout_futures = self.rollout.generate()
-        actor_futures = self.actor.recv_rollout_batch()
-        
-        # 等待所有异步操作完成
-        env_results = env_futures.wait()
-        actor_futures.wait()
-        rollout_futures.wait()
-
-        # 计算环境相关指标
-        env_results_list = [results for results in env_results if results is not None]
-        env_metrics = compute_evaluate_metrics(env_results_list)
-        return env_metrics
+            # 如果有critic模型也冻结其参数
+            if self.critic is not None:
+                logging.info("开始冻结Critic模型参数...")
+                critic_futures = self.critic.freeze_parameters()
+                critic_futures.wait()
+                logging.info("Critic模型参数冻结完成")
+        except Exception as e:
+            logging.error(f"参数冻结失败: {str(e)}", exc_info=True)
+            raise  # 重新抛出异常，确保错误被捕获
 
     def evaluate(self):
         """评估当前模型性能"""
@@ -107,8 +125,55 @@ class FrozenModelRunner:
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
 
+    def _init_record_dir(self):
+        """初始化记录文件保存目录"""
+        base_path = Path(self.record_cfg.get("path", "./grpo_records"))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.record_dir = base_path / f"frozen_run_{timestamp}"
+        self.record_dir.mkdir(parents=True, exist_ok=True)
+        print(f"JSONL记录已启用，保存路径：{self.record_dir}")
+
+    def _write_records(self, step: int):
+        """将缓冲区的记录写入JSONL文件"""
+        if not self.record_buffer:
+            return
+        # 按step分文件存储（如 step_0-9.jsonl）
+        start_step = self.record_buffer[0]["global_step"]
+        end_step = self.record_buffer[-1]["global_step"]
+        record_file = self.record_dir / f"records_step_{start_step}-{end_step}.jsonl"
+        
+        with open(record_file, "a", encoding="utf-8") as f:
+            for item in self.record_buffer:
+                json.dump(item, f, ensure_ascii=False)
+                f.write("\n")  # 每条记录占一行
+        self.record_buffer.clear()
+
+    def generate_rollouts(self):
+        """生成rollout数据，同时收集记录所需的原始数据"""
+        env_futures = self.env.interact()
+        rollout_futures = self.rollout.generate()
+        actor_futures = self.actor.recv_rollout_batch()
+        
+        # 等待所有异步操作完成（获取原始数据而非仅指标）
+        env_results = env_futures.wait()  # 环境输入/输出原始数据
+        actor_results = actor_futures.wait()  # 包含轨迹数据
+        rollout_results = rollout_futures.wait()  # rollout生成的原始结果
+
+        # 计算环境指标（原有逻辑）
+        env_results_list = [results for results in env_results if results is not None]
+        env_metrics = compute_evaluate_metrics(env_results_list)
+
+        # 新增：收集记录数据（仅在启用时执行）
+        self.current_rollout_data = {
+            "env_input": env_results,          # 环境输入（观测、任务描述等）
+            "rollout_trajectories": rollout_results,  # rollout生成的轨迹
+            "actor_batch": actor_results       # actor接收的batch数据
+        }
+
+        return env_metrics
+
     def run(self):
-        """主运行循环：仅生成rollout和计算优势值，不更新模型权重"""
+        """主运行循环：生成rollout、计算优势值，并新增JSONL记录"""
         start_step = self.global_step
         global_pbar = tqdm(
             initial=start_step,
@@ -123,7 +188,7 @@ class FrozenModelRunner:
             self.rollout.set_global_step(self.global_step)
             eval_metrics = {}
 
-            # 定期评估（如果配置）
+            # 定期评估（原有逻辑）
             if (
                 _step % self.cfg.runner.val_check_interval == 0
                 and self.cfg.runner.val_check_interval > 0
@@ -134,18 +199,20 @@ class FrozenModelRunner:
                     self.metric_logger.log(data=eval_metrics, step=_step)
 
             with self.timer("step"):
-                # 生成rollout数据
+                # 生成rollout数据（会收集原始数据到current_rollout_data）
                 with self.timer("generate_rollouts"):
                     env_metrics = self.generate_rollouts()
 
-                # 计算优势值和回报（不更新模型）
+                # 计算优势值和回报（获取原始计算结果）
                 with self.timer("cal_adv_and_returns"):
                     actor_futures = self.actor.compute_advantages_and_returns()
                     actor_rollout_metrics = actor_futures.wait()
+                    # 假设返回结果中包含原始优势值数据（需根据实际actor实现调整）
+                    self.current_adv_data = actor_futures.get_advantages_data()
 
                 self.global_step += 1
 
-                # 检查是否需要保存（仅保存rollout数据相关检查点）
+                # 检查保存和结束条件（原有逻辑）
                 run_val, save_model, is_train_end = check_progress(
                     self.global_step,
                     self.max_steps,
@@ -158,7 +225,25 @@ class FrozenModelRunner:
                 if save_model:
                     self._save_checkpoint()
 
-            # 收集并记录所有指标
+                # 新增：构建记录并加入缓冲区
+                if self.record_enabled:
+                    record = {
+                        "global_step": _step,
+                        "timestamp": datetime.now().isoformat(),
+                        "env_input": self._format_env_input() if self.include_fields["env_input"] else None,
+                        "rollout_trajectories": self._format_rollout_trajectories() if self.include_fields["rollout_trajectories"] else None,
+                        "actor_advantages": self._format_advantages() if self.include_fields["actor_advantages"] else None
+                    }
+                    self.record_buffer.append(record)
+
+            # 新增：每N步写入一次记录（避免频繁IO）
+            if self.record_enabled and (
+                _step % self.record_cfg.get("write_interval", 10) == 0 
+                or _step == self.max_steps - 1
+            ):
+                self._write_records(_step)
+
+            # 收集并记录所有指标（原有逻辑）
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
             rollout_metrics = {
@@ -175,7 +260,51 @@ class FrozenModelRunner:
             global_pbar.set_postfix(logging_metrics)
             global_pbar.update(1)
 
+            if is_train_end:
+                break
+
+        # 最后一步确保所有记录都被写入
+        if self.record_enabled and self.record_buffer:
+            self._write_records(self.max_steps - 1)
+
         self.metric_logger.finish()
+
+    # 新增：格式化记录字段（根据实际数据结构调整）
+    def _format_env_input(self):
+        """格式化环境输入数据（观测、任务描述等）"""
+        formatted = []
+        for env_ep in self.current_rollout_data["env_input"]:
+            if env_ep is None:
+                continue
+            formatted.append({
+                "obs_shape": env_ep["obs"].shape if "obs" in env_ep else None,
+                "dones": env_ep["dones"].tolist() if "dones" in env_ep else None,
+                "rewards": env_ep["rewards"].tolist() if "rewards" in env_ep else None,
+                # 补充其他需要的环境输入字段
+            })
+        return formatted
+
+    def _format_rollout_trajectories(self):
+        """格式化rollout生成的轨迹数据"""
+        formatted = []
+        for traj in self.current_rollout_data["rollout_trajectories"]:
+            formatted.append({
+                "actions": traj["actions"].tolist() if "actions" in traj else None,
+                "log_probs": traj["log_probs"].tolist() if "log_probs" in traj else None,
+                "length": len(traj["actions"]) if "actions" in traj else 0,
+                # 补充其他轨迹相关字段
+            })
+        return formatted
+
+    def _format_advantages(self):
+        """格式化优势值计算结果"""
+        adv_data = self.current_adv_data
+        return {
+            "advantages": adv_data["advantages"].tolist() if "advantages" in adv_data else None,
+            "returns": adv_data["returns"].tolist() if "returns" in adv_data else None,
+            "values": adv_data["values"].tolist() if "values" in adv_data else None,
+            # 补充其他优势值相关字段
+        }
 
     def _save_checkpoint(self):
         """保存检查点（仅保存必要的rollout数据和状态，不包含模型权重更新）"""
@@ -184,7 +313,7 @@ class FrozenModelRunner:
             self.cfg.runner.logger.experiment_name,
             f"checkpoints/global_step_{self.global_step}",
         )
-        # 保存rollout相关状态（不包含模型权重更新）
+        # 保存rollout相关状态
         rollout_save_path = os.path.join(base_output_dir, "rollout")
         os.makedirs(rollout_save_path, exist_ok=True)
         self.rollout.save_checkpoint(rollout_save_path, self.global_step).wait()
@@ -194,6 +323,8 @@ class FrozenModelRunner:
         os.makedirs(env_save_path, exist_ok=True)
         self.env.save_checkpoint(env_save_path, self.global_step).wait()
 
+        logging.info(f"检查点已保存至: {base_output_dir}")
+
     def set_max_steps(self):
         """设置最大运行步数"""
         self.num_steps_per_epoch = 1
@@ -201,6 +332,7 @@ class FrozenModelRunner:
 
         if (max_steps := self.cfg.runner.get("max_steps", -1)) >= 0:
             self.max_steps = min(self.max_steps, max_steps)
+        logging.info(f"最大训练步数设置为: {self.max_steps}")
 
     @property
     def epoch(self):

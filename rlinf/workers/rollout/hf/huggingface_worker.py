@@ -221,27 +221,59 @@ class MultiStepRolloutWorker(Worker):
             self._save_records()
 
     def _record_step(self, epoch, chunk, stage, env_obs, actions, result):
-        """记录单步的输入输出"""
-        # 根据实际任务类型解析obs（这里以具身任务为例，可根据需求修改）
+        """记录单步的输入输出，确保所有数据可JSON序列化"""
+        # 处理观测数据中的 Tensor，转换为列表
+        processed_obs = {}
+        if env_obs is not None:
+            for key, value in env_obs.items():
+                if isinstance(value, torch.Tensor):
+                    # Tensor 转换为列表（若维度较大，可只记录形状）
+                    processed_obs[key] = value.tolist()
+                    # 可选：仅记录形状以节省空间（适用于图像等大张量）
+                    # processed_obs[f"{key}_shape"] = list(value.shape)
+                elif isinstance(value, (list, dict, str, int, float, bool)):
+                    # 其他可序列化类型直接保留
+                    processed_obs[key] = value
+                else:
+                    # 未知类型转换为字符串描述
+                    processed_obs[key] = str(value)
+        
         record = {
             "epoch": epoch,
             "chunk": chunk,
             "stage": stage,
             "timestamp": datetime.now().isoformat(),
             "input": {
-                # 示例：解析观测数据（根据env_obs的实际结构调整）
-                "obs_shape": env_obs["obs"].shape if "obs" in env_obs else None,
-                "dones": env_obs["dones"].tolist() if "dones" in env_obs else None,
-                # 若为文本任务，可直接记录文本："prompt": env_obs["prompt"]
+                "obs": processed_obs  # 使用处理后的观测数据
             },
             "output": {
-                "actions": actions.tolist(),  # 模型生成的动作/输出
-                "action_shape": actions.shape,
-                # 可选：记录额外信息（如价值估计、logprobs等）
+                "actions": actions.tolist(),
+                "action_shape": list(actions.shape),  # 元组转换为列表
                 "values": result["prev_values"].tolist() if "prev_values" in result else None
             }
         }
         self.rollout_records.append(record)
+
+    # def _record_step(self, epoch, chunk, stage, env_obs, actions, result):
+    #     """记录单步的输入输出"""
+    #     # 根据实际任务类型解析obs（这里以具身任务为例，可根据需求修改）
+    #     record = {
+    #         "epoch": epoch,
+    #         "chunk": chunk,
+    #         "stage": stage,
+    #         "timestamp": datetime.now().isoformat(),
+    #         "input": {
+    #             # 示例：解析观测数据（根据env_obs的实际结构调整）
+    #             "obs": env_obs if env_obs else None,
+    #         },
+    #         "output": {
+    #             "actions": actions.tolist(),  # 模型生成的动作/输出
+    #             "action_shape": actions.shape,
+    #             # 可选：记录额外信息（如价值估计、logprobs等）
+    #             "values": result["prev_values"].tolist() if "prev_values" in result else None
+    #         }
+    #     }
+    #     self.rollout_records.append(record)
 
     def _save_records(self):
         """将记录保存为JSON文件"""

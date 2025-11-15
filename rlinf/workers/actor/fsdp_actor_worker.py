@@ -128,6 +128,14 @@ class FSDPActor(FSDPModelManager, Worker):
             f"Actor rank {self._rank} will send weights to {self._weight_dst_rank_in_rollout}"
         )
 
+    def freeze_parameters(self):
+        """冻结当前 worker 管理的模型参数，禁止梯度更新"""
+        if self.model is not None:  # 确保模型已初始化
+            for param in self.model.parameters():
+                param.requires_grad = False
+            # 可选：设置模型为 eval 模式（如果需要）
+            self.model.eval()
+
     def del_reshard_state_dict(self) -> None:
         if hasattr(self, "rollout_state_dict"):
             del self.rollout_state_dict
@@ -545,7 +553,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.stage_num = cfg.rollout.pipeline_stage_num
 
         self.channel = self.connect_channel(cfg.actor.channel.name)
-
+        
+    def freeze_parameters(self):
+        """冻结模型所有参数，禁止梯度更新"""
+        if hasattr(self, 'model'):
+            for param in self.model.parameters():
+                param.requires_grad = False
+    
     def init_worker(self):
         self.setup_model_and_optimizer()
 

@@ -18,6 +18,14 @@ cluster:
     rollout: 4-7
 
 runner:
+  record:
+    enable: true  # 是否启用新增记录
+    path: ./grpo_records  # JSONL文件保存根路径
+    # 可选：指定需要记录的内容（按需开启）
+    include:
+      env_input: true
+      rollout_trajectories: true
+      actor_advantages: true
   task_type: embodied
   logger:
     log_path: "./logs"
@@ -99,7 +107,7 @@ rollout:
     queue_size: 0
   mode: "colocate"
   generation_backend: "huggingface"
-  model_dir: "/home/cn/model_weights"
+  model_dir: "/DATA2/cn/model_weights"
   precision: ${actor.model.precision}
   enable_offload: True
   pipeline_stage_num: 2
@@ -113,8 +121,8 @@ actor:
     queue_name: "replay_buffer"
     queue_size: 0
   training_backend: "fsdp"
-  checkpoint_load_path: "/home/cn/model_weights"
-  checkpoint_save_path: "/home/cn/saved_checkpoints"
+  checkpoint_load_path: "/DATA2/cn/model_weights"
+  checkpoint_save_path: "/DATA2/cn/saved_checkpoints"
   micro_batch_size: 10
   global_batch_size: 160
   seed: 1234
@@ -122,7 +130,7 @@ actor:
 
   tokenizer:
     tokenizer_type: "HuggingFaceTokenizer"
-    tokenizer_model: "/home/cn/model_weights"
+    tokenizer_model: "/DATA2/cn/model_weights"
     use_fast: False
     trust_remote_code: True
     padding_side: "right"
@@ -203,3 +211,7 @@ apiworkers:
   api_url: "https://external-llm-api.com/process"
   api_key: "your-api-key"
   timeout: 30
+  reward_channel: "reward_results_channel"  # 与奖励计算组件的输出通道对应
+  env_channel: "env_metrics_channel"        # 与环境组件的输出通道对应
+  record_enabled: True
+  record_dir: "/home/cn/RLinf/api_worker_records" 
